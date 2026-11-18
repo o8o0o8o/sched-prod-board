@@ -7,9 +7,16 @@ const loader = board.querySelector('[data-testid="loader"]');
 const empty = board.querySelector('[data-testid="empty"]');
 const errorBox = board.querySelector('[data-role="error"]');
 const updated = document.querySelector('[data-role="updated"]');
+const panel = document.querySelector('[data-testid="incident-panel"]');
+const panelId = panel.querySelector('[data-role="panel-id"]');
+const panelFacts = panel.querySelector('[data-role="panel-facts"]');
+const panelState = panel.querySelector('[data-role="panel-state"]');
+const panelAck = panel.querySelector('[data-testid="panel-ack"]');
 
+const byId = new Map(); // id -> incident (latest data)
 const acked = new Map(); // id -> ackedAt; survives refreshes
 const pending = new Set();
+let selected = null; // the incident the panel is open on, by id (never by position)
 
 // R5: viewer's local zone and locale order (en-GB/de/fr… give dd/mm, en-US gives mm/dd).
 const fmt = new Intl.DateTimeFormat(navigator.languages?.[0] || navigator.language, {
@@ -29,38 +36,59 @@ function rowHtml(i) {
     <span class="act"></span>`;
 }
 
-function renderAction(li) {
+// Rows carry no Ack (product, step 2): only the acked mark.
+function renderRowState(li) {
   const id = li.dataset.id;
   const slot = li.querySelector('.act');
-  if (acked.has(id)) {
-    if (!slot.querySelector('[data-testid="acked"]')) {
-      slot.innerHTML = `<span data-testid="acked" class="acked">✓ acked</span>`;
-    }
+  if (acked.has(id) && !slot.querySelector('[data-testid="acked"]')) {
+    slot.innerHTML = `<span data-testid="acked" class="acked">✓ acked</span>`;
     li.classList.add('is-acked');
-  } else if (!slot.querySelector('[data-testid="ack"]')) {
-    slot.innerHTML = `<button type="button" data-testid="ack">Ack</button>`;
   }
-  const btn = slot.querySelector('[data-testid="ack"]');
-  if (btn) btn.disabled = pending.has(id);
+  li.classList.toggle('is-selected', id === selected);
+  li.setAttribute('aria-selected', String(id === selected));
 }
 
-// R1: keyed render, newest first. Existing rows are kept (not rebuilt), new ones go in at the top.
+function renderPanel() {
+  if (!selected) { panel.hidden = true; return; }
+  const i = byId.get(selected);
+  panel.hidden = false;
+  panelId.textContent = selected;
+  panelFacts.innerHTML = i
+    ? `<dt>severity</dt><dd>${esc(i.severity)}</dd>
+       <dt>service</dt><dd>${esc(i.service)} · ${esc(i.region)}</dd>
+       <dt>summary</dt><dd>${esc(i.summary)}</dd>
+       <dt>opened</dt><dd><time datetime="${esc(i.openedAt)}">${esc(localTime(i.openedAt))}</time></dd>`
+    : '';
+  if (acked.has(selected)) {
+    panelState.textContent = `Acked at ${localTime(acked.get(selected))}`;
+    panelAck.hidden = true;
+  } else {
+    panelState.textContent = '';
+    panelAck.hidden = false;
+    panelAck.textContent = `Ack ${selected}`;
+    panelAck.disabled = pending.has(selected);
+  }
+}
+
+// R1: keyed render, newest first. Existing rows are kept (never removed and rebuilt), new ones go in at the top.
 function render(incidents) {
   const sorted = [...incidents].sort((a, b) => b.openedAt.localeCompare(a.openedAt));
   const existing = new Map([...list.children].map((li) => [li.dataset.id, li]));
   let prev = null;
   for (const i of sorted) {
+    byId.set(i.id, i);
     let li = existing.get(i.id);
     if (!li) {
       li = document.createElement('li');
       li.setAttribute('data-testid', 'incident-row');
       li.dataset.id = i.id;
       li.className = `row ${i.severity}`;
+      li.tabIndex = 0;
       li.innerHTML = rowHtml(i);
       if (existing.size) li.classList.add('is-new');
     }
     existing.delete(i.id);
-    renderAction(li);
+    renderRowState(li);
     const want = prev ? prev.nextSibling : list.firstChild;
     if (want !== li) list.insertBefore(li, want);
     prev = li;
@@ -69,27 +97,43 @@ function render(incidents) {
   const none = sorted.length === 0;
   empty.hidden = !none;
   list.hidden = none;
+  renderPanel();
 }
 
-// R2: Ack the row that was clicked, by its id.
-list.addEventListener('click', async (e) => {
-  const btn = e.target.closest('[data-testid="ack"]');
-  if (!btn) return;
-  const li = btn.closest('[data-testid="incident-row"]');
-  const id = li.dataset.id;
-  if (pending.has(id) || acked.has(id)) return;
+function select(id) {
+  selected = id;
+  for (const li of list.children) renderRowState(li);
+  renderPanel();
+}
+
+// A row opens its incident panel. The panel names the incident; Ack lives there.
+list.addEventListener('click', (e) => {
+  const li = e.target.closest('[data-testid="incident-row"]');
+  if (li) select(li.dataset.id);
+});
+list.addEventListener('keydown', (e) => {
+  const li = e.target.closest('[data-testid="incident-row"]');
+  if (li && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); select(li.dataset.id); }
+});
+panel.querySelector('[data-role="panel-close"]').addEventListener('click', () => select(null));
+
+panelAck.addEventListener('click', async () => {
+  const id = selected; // the id the panel names, not a row position
+  if (!id || pending.has(id) || acked.has(id)) return;
   pending.add(id);
-  renderAction(li);
+  renderPanel();
   try {
     const reply = await ack(id);
-    acked.set(id, reply.ackedAt);
+    acked.set(reply.id, reply.ackedAt);
     errorBox.hidden = true;
   } catch (err) {
     errorBox.textContent = `Ack ${id} failed: ${err.message}`;
     errorBox.hidden = false;
   } finally {
     pending.delete(id);
-    renderAction(li);
+    const li = list.querySelector(`[data-testid="incident-row"][data-id="${CSS.escape(id)}"]`);
+    if (li) renderRowState(li);
+    renderPanel();
   }
 });
 
